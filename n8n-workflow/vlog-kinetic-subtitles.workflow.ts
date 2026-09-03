@@ -289,6 +289,7 @@ const buildKineticCues = node({
         '\n' +
         'const lines = [];\n' +
         'let group = [];\n' +
+        'let groupEmphasis = false;\n' +
         'function flushLine() {\n' +
         '  if (!group.length) return;\n' +
         "  const text = group.map(function (w) { return w.text.toUpperCase(); }).join(' ');\n" +
@@ -296,13 +297,15 @@ const buildKineticCues = node({
         '    text: text,\n' +
         '    start: group[0].start,\n' +
         '    end: group[group.length - 1].end,\n' +
-        '    emphasis: group.some(function (w) { return w.emphasis; }),\n' +
+        '    emphasis: groupEmphasis,\n' +
         '  });\n' +
         '  group = [];\n' +
         '}\n' +
         'for (const w of words) {\n' +
+        '  if (group.length && w.emphasis !== groupEmphasis) flushLine();\n' +
+        '  if (!group.length) groupEmphasis = w.emphasis;\n' +
         '  group.push(w);\n' +
-        '  if (w.emphasis || group.length >= 3) flushLine();\n' +
+        '  if (!w.emphasis && group.length >= 3) flushLine();\n' +
         '}\n' +
         'flushLine();\n' +
         '\n' +
