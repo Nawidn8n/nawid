@@ -287,26 +287,46 @@ const buildKineticCues = node({
         '}\n' +
         'if (current) words.push(current);\n' +
         '\n' +
-        'const cues = [];\n' +
+        'const lines = [];\n' +
         'let group = [];\n' +
-        'let groupStart = null;\n' +
-        'function flushGroup() {\n' +
+        'function flushLine() {\n' +
         '  if (!group.length) return;\n' +
-        '  cues.push({\n' +
-        '    start: groupStart,\n' +
-        '    end: group[group.length - 1].end + 0.05,\n' +
-        '    words: group.map(function (w) { return { t: w.text.toUpperCase(), e: w.emphasis }; }),\n' +
+        "  const text = group.map(function (w) { return w.text.toUpperCase(); }).join(' ');\n" +
+        '  lines.push({\n' +
+        '    text: text,\n' +
+        '    start: group[0].start,\n' +
+        '    end: group[group.length - 1].end,\n' +
+        '    emphasis: group.some(function (w) { return w.emphasis; }),\n' +
         '  });\n' +
         '  group = [];\n' +
         '}\n' +
         'for (const w of words) {\n' +
-        '  if (!group.length) groupStart = w.start;\n' +
         '  group.push(w);\n' +
-        '  if (w.emphasis || group.length >= 4) flushGroup();\n' +
+        '  if (w.emphasis || group.length >= 3) flushLine();\n' +
         '}\n' +
-        'flushGroup();\n' +
+        'flushLine();\n' +
         '\n' +
-        'const cuesPayload = { cues: cues };\n' +
+        'const pages = [];\n' +
+        'let pageLines = [];\n' +
+        'function flushPage(nextStart) {\n' +
+        '  if (!pageLines.length) return;\n' +
+        '  const lastEnd = pageLines[pageLines.length - 1].end;\n' +
+        '  pages.push({\n' +
+        '    lines: pageLines.map(function (ln) { return { text: ln.text, start: ln.start, emphasis: ln.emphasis }; }),\n' +
+        '    clear_at: nextStart != null ? Math.max(lastEnd + 0.15, nextStart - 0.2) : lastEnd + 1.0,\n' +
+        '  });\n' +
+        '  pageLines = [];\n' +
+        '}\n' +
+        'for (let i = 0; i < lines.length; i++) {\n' +
+        '  pageLines.push(lines[i]);\n' +
+        '  if (pageLines.length >= 5) {\n' +
+        '    const next = lines[i + 1];\n' +
+        '    flushPage(next ? next.start : null);\n' +
+        '  }\n' +
+        '}\n' +
+        'flushPage(null);\n' +
+        '\n' +
+        'const cuesPayload = { pages: pages };\n' +
         "const audioBuffer = Buffer.from(resp.audio_base64, 'base64');\n" +
         'const cuesBuffer = Buffer.from(JSON.stringify(cuesPayload, null, 2));\n' +
         '\n' +
@@ -315,7 +335,7 @@ const buildKineticCues = node({
         '    topic: clean.topic,\n' +
         '    voiceId: clean.voiceId,\n' +
         '    scriptPath: clean.scriptPath,\n' +
-        '    cueCount: cues.length,\n' +
+        '    pageCount: pages.length,\n' +
         '  },\n' +
         '  binary: {\n' +
         '    voice: {\n' +
@@ -337,7 +357,7 @@ const buildKineticCues = node({
       topic: 'A weekend trip to the mountains',
       voiceId: '21m00Tcm4TlvDq8ikWAM',
       scriptPath: '/data/scripts/burn_kinetic_subtitles.py',
-      cueCount: 5,
+      pageCount: 3,
     },
   ],
 });

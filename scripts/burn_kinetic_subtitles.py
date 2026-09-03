@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-Burn animated "editorial-kinetic" subtitles onto a real video and mux in a
-narration voiceover track. Style is adapted from the editorial-kinetic
-Hyperframes template (bold white/red uppercase captions, punch-in motion)
-but reworked as a lower-third caption overlay so the underlying footage
-stays visible, driven by real word timings instead of a fixed script.
+Burn full-screen "editorial-kinetic" sequential captions onto a video and
+mux in a narration voiceover track. Visual language matches the
+editorial-kinetic Hyperframes reference: right-aligned lines of varying
+size building top-to-bottom over a darkened frame, a red rule down the
+left edge, a page counter, a rotated side label, and a bottom micro
+caption. Driven by real word timings instead of a fixed script, so any
+AI-generated narration can drive it.
 
 Usage:
     python3 burn_kinetic_subtitles.py \
@@ -12,24 +14,31 @@ Usage:
         --cues cues.json \
         --voiceover voiceover.mp3 \
         --out final.mp4 \
-        [--original-volume 0.15] [--voiceover-volume 1.0]
+        [--original-volume 0.12] [--voiceover-volume 1.0] [--scrim 0.62]
 
 cues.json shape:
 {
-  "cues": [
-    {"start": 0.10, "end": 1.05, "words": [{"t": "EVERY", "e": false}, {"t": "IDEA", "e": true}]},
+  "pages": [
+    {
+      "lines": [
+        {"text": "EVERY GREAT", "start": 0.30, "emphasis": false},
+        {"text": "IDEA", "start": 0.85, "emphasis": true},
+        {"text": "STARTS WITH", "start": 1.45, "emphasis": false}
+      ],
+      "clear_at": 3.6
+    },
     ...
   ]
 }
-start/end are seconds from the start of the voiceover track. "e" marks a
-word as an emphasis/keyword (rendered larger, in red).
+"start" is seconds from the start of the voiceover track when that line
+begins appearing; "clear_at" is when the whole page fades out. "emphasis"
+lines are rendered large and red; everything else is white, sized by a
+short/medium heuristic.
 """
 import argparse
 import json
-import math
 import os
 import subprocess
-import sys
 import tempfile
 
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
@@ -37,7 +46,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageFilter
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 RED = (242, 13, 47)
 WHITE = (247, 247, 247)
-GREY = (200, 200, 200)
+GREY = (150, 150, 150)
 
 FONT_CANDIDATES = [
     os.path.join(SCRIPT_DIR, "assets", "DejaVuSansMono-Bold.ttf"),
@@ -57,6 +66,18 @@ def resolve_font_path():
 
 FONT_PATH = resolve_font_path()
 
+RIGHT_MARGIN = 150
+RULE_X = 90
+RULE_TOP = 120
+RULE_BOTTOM = 1800
+BLOCK_TOP = 640
+LINE_GAP = 22
+ENTER_DUR = 0.32
+PAGE_FADE = 0.28
+EMPHASIS_SIZE = 148
+MEDIUM_SIZE = 76
+SHORT_SIZE = 44
+
 
 def clamp(x, a=0.0, b=1.0):
     return max(a, min(b, x))
@@ -73,10 +94,7 @@ def font(size):
 
 def ffprobe_json(path):
     out = subprocess.run(
-        [
-            "ffprobe", "-v", "error", "-print_format", "json",
-            "-show_streams", "-show_format", path,
-        ],
+        ["ffprobe", "-v", "error", "-print_format", "json", "-show_streams", "-show_format", path],
         capture_output=True, text=True, check=True,
     )
     return json.loads(out.stdout)
@@ -89,118 +107,112 @@ def video_info(path):
     height = int(vstream["height"])
     num, den = vstream.get("r_frame_rate", "24/1").split("/")
     fps = float(num) / float(den) if float(den) else 24.0
-    duration = float(data["format"].get("duration") or vstream.get("duration") or 0)
-    return width, height, fps, duration
+    return width, height, fps
 
 
-def audio_duration(path):
-    data = ffprobe_json(path)
-    return float(data["format"]["duration"])
-
-
-def load_cues(path):
+def load_pages(path):
     with open(path, "r", encoding="utf-8") as f:
         payload = json.load(f)
-    return payload["cues"]
+    pages = payload["pages"]
+    for page in pages:
+        page["lines"].sort(key=lambda ln: ln["start"])
+    pages.sort(key=lambda p: p["lines"][0]["start"])
+    return pages
 
 
-def active_cue(cues, t):
-    for cue in cues:
-        if cue["start"] <= t < cue["end"]:
-            return cue
-    return None
+def active_page(pages, t):
+    for i, page in enumerate(pages):
+        start = page["lines"][0]["start"]
+        if start <= t < page["clear_at"]:
+            return i, page
+    return None, None
 
 
-def measure_line(draw, words, base_size):
-    """Return list of (text, font, color, width) for one caption line."""
-    parts = []
-    total_w = 0
-    gap = int(base_size * 0.32)
-    for w in words:
-        size = int(base_size * (1.28 if w.get("e") else 1.0))
-        color = RED if w.get("e") else WHITE
+def line_size(line):
+    if line.get("emphasis"):
+        return EMPHASIS_SIZE
+    text = line["text"]
+    if len(text) <= 10 and len(text.split()) <= 2:
+        return SHORT_SIZE
+    return MEDIUM_SIZE
+
+
+def fit_font(draw, text, size, max_w):
+    while size > 16:
         f = font(size)
-        bbox = draw.textbbox((0, 0), w["t"], font=f)
-        tw = bbox[2] - bbox[0]
-        parts.append((w["t"], f, color, tw))
-        total_w += tw + gap
-    if parts:
-        total_w -= gap
-    return parts, total_w
-
-
-def fit_base_size(draw, words, max_w, start_size=64, min_size=26):
-    size = start_size
-    while size > min_size:
-        _, total_w = measure_line(draw, words, size)
-        if total_w <= max_w:
-            break
+        w = draw.textbbox((0, 0), text, font=f)[2]
+        if w <= max_w:
+            return f
         size -= 2
-    return size
+    return font(16)
 
 
-def draw_caption(base, cue, t, width, height):
-    local = t - cue["start"]
-    length = cue["end"] - cue["start"]
-    enter = ease_out(local / 0.18)
-    leave = clamp((length - local) / 0.16)
-    progress = min(enter, leave)
-    if progress <= 0.001:
+def draw_page(base, page, t, width, height):
+    page_start = page["lines"][0]["start"]
+    clear_at = page["clear_at"]
+    page_alpha = 1.0
+    if t > clear_at - PAGE_FADE:
+        page_alpha = clamp((clear_at - t) / PAGE_FADE)
+    if page_alpha <= 0.01:
         return
 
     layer = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     draw = ImageDraw.Draw(layer)
+    max_w = width - RIGHT_MARGIN - 120
 
-    max_w = int(width * 0.82)
-    base_size = fit_base_size(draw, cue["words"], max_w, start_size=int(height * 0.052))
-    parts, total_w = measure_line(draw, cue["words"], base_size)
-
-    tallest = max((p[1].getbbox(p[0])[3] for p in parts), default=base_size)
-    pad_x, pad_y = 34, 22
-    card_w = total_w + pad_x * 2
-    card_h = tallest + pad_y * 2
-    cx = (width - card_w) // 2
-    cy = int(height * 0.74) - card_h // 2
-
-    y_shift = int((1 - progress) * 40)
-    alpha = clamp(progress)
-
-    card_layer = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-    card_draw = ImageDraw.Draw(card_layer)
-    card_draw.rounded_rectangle(
-        (cx, cy + y_shift, cx + card_w, cy + card_h + y_shift),
-        radius=14,
-        fill=(8, 8, 8, int(168 * alpha)),
-    )
-    card_draw.rectangle(
-        (cx, cy + y_shift, cx + 8, cy + card_h + y_shift),
-        fill=(*RED, int(255 * alpha)),
-    )
-    layer.alpha_composite(card_layer)
-
-    x = cx + pad_x
-    gap = int(base_size * 0.32)
-    text_layer = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-    text_draw = ImageDraw.Draw(text_layer)
-    for word_text, f, color, tw in parts:
-        text_draw.text(
-            (x, cy + pad_y - 4 + y_shift),
-            word_text,
-            font=f,
-            fill=(*color, int(255 * alpha)),
-        )
-        x += tw + gap
-    layer.alpha_composite(text_layer)
+    y = BLOCK_TOP
+    for line in page["lines"]:
+        if line["start"] > t:
+            continue
+        size = line_size(line)
+        color = RED if line.get("emphasis") else WHITE
+        f = fit_font(draw, line["text"], size, max_w)
+        bbox = draw.textbbox((0, 0), line["text"], font=f)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        local = t - line["start"]
+        progress = ease_out(local / ENTER_DUR)
+        alpha = clamp(progress) * page_alpha
+        y_shift = int((1 - progress) * 28)
+        x = width - RIGHT_MARGIN - tw
+        line_layer = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        ld = ImageDraw.Draw(line_layer)
+        ld.text((x, y + y_shift), line["text"], font=f, fill=(*color, int(255 * alpha)))
+        layer.alpha_composite(line_layer)
+        y += th + LINE_GAP
 
     base.alpha_composite(layer)
 
 
-def render_overlay_video(video_path, cues, tmp_silent_path):
-    width, height, fps, duration = video_info(video_path)
+def draw_chrome(base, page_index, total_pages, width, height, t):
+    layer = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    d = ImageDraw.Draw(layer)
+
+    d.line((RULE_X, RULE_TOP, RULE_X, RULE_BOTTOM), fill=(*RED, 255), width=8)
+
+    label = "0{} / SEQUENTIAL CAPTIONS".format(min(page_index + 1, 9))
+    d.text((RULE_X + 20, 78), label, font=font(26), fill=RED)
+
+    micro = "TOP → BOTTOM  •  NEXT PAGE RESTARTS AT TOP"
+    d.text((RULE_X + 20, height - 92), micro, font=font(20), fill=GREY)
+
+    side = "HOOK • BODY • PAYOFF"
+    sf = font(20)
+    sb = d.textbbox((0, 0), side, font=sf)
+    sw, sh = sb[2] - sb[0], sb[3] - sb[1]
+    side_layer = Image.new("RGBA", (sw + 20, sh + 20), (0, 0, 0, 0))
+    sld = ImageDraw.Draw(side_layer)
+    sld.text((10, 6), side, font=sf, fill=(*GREY, 255))
+    side_layer = side_layer.rotate(90, expand=True, resample=Image.Resampling.BICUBIC)
+    base.alpha_composite(side_layer, (width - 46, height // 2 - sw // 2))
+
+    base.alpha_composite(layer)
+
+
+def render_overlay_video(video_path, pages, scrim, tmp_silent_path):
+    width, height, fps = video_info(video_path)
     decode_cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-        "-i", video_path,
-        "-f", "rawvideo", "-pix_fmt", "rgb24", "-an", "-",
+        "-i", video_path, "-f", "rawvideo", "-pix_fmt", "rgb24", "-an", "-",
     ]
     encode_cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
@@ -213,6 +225,12 @@ def render_overlay_video(video_path, cues, tmp_silent_path):
     decoder = subprocess.Popen(decode_cmd, stdout=subprocess.PIPE)
     encoder = subprocess.Popen(encode_cmd, stdin=subprocess.PIPE)
 
+    scrim_layer = Image.new("RGBA", (width, height), (0, 0, 0, int(255 * scrim)))
+    glow = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    gd = ImageDraw.Draw(glow)
+    gd.ellipse((-360, -120, 640, 900), fill=(140, 0, 20, 130))
+    glow = glow.filter(ImageFilter.GaussianBlur(160))
+
     frame_bytes = width * height * 3
     n = 0
     try:
@@ -222,9 +240,12 @@ def render_overlay_video(video_path, cues, tmp_silent_path):
                 break
             t = n / fps
             frame = Image.frombuffer("RGB", (width, height), raw, "raw", "RGB", 0, 1).convert("RGBA")
-            cue = active_cue(cues, t)
-            if cue:
-                draw_caption(frame, cue, t, width, height)
+            frame.alpha_composite(scrim_layer)
+            frame.alpha_composite(glow)
+            idx, page = active_page(pages, t)
+            if page:
+                draw_page(frame, page, t, width, height)
+                draw_chrome(frame, idx, len(pages), width, height, t)
             encoder.stdin.write(frame.convert("RGB").tobytes())
             n += 1
     finally:
@@ -235,11 +256,8 @@ def render_overlay_video(video_path, cues, tmp_silent_path):
         if code:
             raise SystemExit(f"ffmpeg encode failed with code {code}")
 
-    return width, height, fps, duration
 
-
-def mux_audio(video_only_path, video_path, voiceover_path, out_path,
-               original_volume, voiceover_volume):
+def mux_audio(video_only_path, video_path, voiceover_path, out_path, original_volume, voiceover_volume):
     filter_complex = (
         f"[1:a]volume={original_volume}[orig];"
         f"[2:a]volume={voiceover_volume}[vo];"
@@ -264,20 +282,18 @@ def main():
     ap.add_argument("--cues", required=True)
     ap.add_argument("--voiceover", required=True)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--original-volume", type=float, default=0.15)
+    ap.add_argument("--original-volume", type=float, default=0.12)
     ap.add_argument("--voiceover-volume", type=float, default=1.0)
+    ap.add_argument("--scrim", type=float, default=0.62,
+                     help="0-1 darkness overlay behind the captions so they read like the reference over any footage")
     args = ap.parse_args()
 
-    cues = load_cues(args.cues)
-    cues.sort(key=lambda c: c["start"])
+    pages = load_pages(args.cues)
 
     with tempfile.TemporaryDirectory() as tmp:
         silent_path = os.path.join(tmp, "overlay_silent.mp4")
-        render_overlay_video(args.video, cues, silent_path)
-        mux_audio(
-            silent_path, args.video, args.voiceover, args.out,
-            args.original_volume, args.voiceover_volume,
-        )
+        render_overlay_video(args.video, pages, args.scrim, silent_path)
+        mux_audio(silent_path, args.video, args.voiceover, args.out, args.original_volume, args.voiceover_volume)
 
     print(f"Wrote {args.out}")
 

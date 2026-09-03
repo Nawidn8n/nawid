@@ -27,9 +27,11 @@ host is set up — see Setup below).
    `/v1/text-to-speech/{voice_id}/with-timestamps`) — turns the clean
    narration into speech, returning audio plus character-level timestamps.
 6. **Build Kinetic Cues** (Code) — turns the character alignment into
-   word-level timings, groups words into short 2-4 word caption bursts,
-   carries the emphasis flag per word, and base64-decodes the voiceover
-   audio. Produces the `cues.json` the renderer expects.
+   word-level timings, groups words into short lines (2-3 words, breaking
+   on an emphasis word), groups every 5 lines into a "page", and
+   base64-decodes the voiceover audio. Produces the `cues.json` the
+   renderer expects: `{"pages": [{"lines": [{"text","start","emphasis"}],
+   "clear_at"}]}`.
 7. **Prepare Paths** (Code) — computes a per-execution work directory and
    file paths on the render host.
 8. **Make Work Dir** (SSH) — `mkdir -p` the work directory on the render
@@ -95,9 +97,13 @@ disk instead — the render script itself doesn't change.
 
 ## Customizing the look
 
-`scripts/burn_kinetic_subtitles.py` draws one caption "card" per cue:
-white bold uppercase text on a semi-transparent dark rounded rectangle,
-a red accent bar on the left edge, emphasis words larger and in red
-(`#f20d2f`), positioned in the lower third. Tweak `RED`, `WHITE`, the
-`0.74` vertical anchor, card padding, or animation easing at the top of
-that file to restyle it.
+`scripts/burn_kinetic_subtitles.py` renders full-screen sequential
+kinetic captions, matching the reference template's own visual language
+rather than a small lower-third caption box: right-aligned lines build
+top-to-bottom over a darkened frame (`--scrim`, default 0.62), each
+"page" of up to 5 lines fades out together before the next page starts,
+emphasis lines are large and red (`#f20d2f`), a red rule runs down the
+left edge, and a page counter / rotated side label / bottom micro caption
+match the source template's chrome. Tweak `RED`, `WHITE`, `EMPHASIS_SIZE`
+/ `MEDIUM_SIZE` / `SHORT_SIZE`, `RIGHT_MARGIN`, `BLOCK_TOP`, or the
+`--scrim` default at the top of that file to restyle it.
